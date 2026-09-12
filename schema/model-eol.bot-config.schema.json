@@ -54,6 +54,13 @@
       },
       "default": { "models": [], "paths": [] }
     },
+    "waivers": {
+      "type": "array",
+      "maxItems": 500,
+      "items": { "$ref": "#/definitions/waiver" },
+      "default": [],
+      "description": "Owned, expiring exceptions that remain visible in reports while active."
+    },
     "overrides": {
       "type": "array",
       "items": { "$ref": "#/definitions/pathOverride" },
@@ -86,7 +93,7 @@
           "type": ["string", "null"],
           "minLength": 1,
           "default": null,
-          "description": "Opt-in repository-owned command run independently for each patchable migration only in the read-only evaluate phase. Write-capable publication consumes its commit-bound result manifest and never executes this command."
+          "description": "Opt-in repository-owned command run independently for each patchable migration only in the read-only evaluate phase. Receives MODEL_EOL_OLD_ID, MODEL_EOL_NEW_ID, MODEL_EOL_PLAN, MODEL_EOL_REPORT, MODEL_EOL_VIA, and MODEL_EOL_EVAL_MODE. Write-capable publication consumes its commit-bound result manifest and never executes this command."
         },
         "timeout_ms": {
           "type": "integer",
@@ -120,6 +127,7 @@
     "via": null,
     "feeds": { "allow_vendored_fallback": false },
     "ignore": { "models": [], "paths": [] },
+    "waivers": [],
     "overrides": [],
     "routes": [],
     "issues": { "enabled": true },
@@ -144,6 +152,24 @@
         "paths": { "$ref": "#/definitions/stringArray" }
       }
     },
+    "waiver": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["model", "reason", "owner", "expires"],
+      "properties": {
+        "model": { "type": "string", "minLength": 1 },
+        "paths": { "$ref": "#/definitions/stringArray" },
+        "via": { "type": "string", "minLength": 1 },
+        "reason": { "type": "string", "minLength": 1, "maxLength": 500 },
+        "owner": { "type": "string", "minLength": 1, "maxLength": 200 },
+        "expires": { "type": "string", "format": "date" }
+      }
+    },
+    "waivers": {
+      "type": "array",
+      "maxItems": 500,
+      "items": { "$ref": "#/definitions/waiver" }
+    },
     "pathOverride": {
       "type": "object",
       "additionalProperties": false,
@@ -153,7 +179,8 @@
         "days": { "type": "integer", "minimum": 0 },
         "scope": { "enum": ["direct", "all"] },
         "via": { "type": ["string", "null"], "minLength": 1 },
-        "ignore": { "$ref": "#/definitions/ignore" }
+        "ignore": { "$ref": "#/definitions/ignore" },
+        "waivers": { "$ref": "#/definitions/waivers" }
       }
     },
     "referenceRoute": {

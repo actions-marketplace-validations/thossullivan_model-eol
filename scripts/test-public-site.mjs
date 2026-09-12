@@ -22,7 +22,17 @@ const output = path.join(temp, 'site')
 const receiptFile = path.join(temp, 'feed-refresh-receipt.json')
 const checkedAt = '2026-08-18T12:34:56Z'
 const refreshRun = 'https://github.com/thossullivan/model-eol/actions/runs/123456'
+const refreshWorkflow = fs.readFileSync(path.join(root, '.github', 'workflows', 'feed-refresh.yml'), 'utf8')
 let server = null
+
+assert(
+  refreshWorkflow.includes('startswith("feed-refresh/")') &&
+  refreshWorkflow.includes('gh pr edit') &&
+  refreshWorkflow.includes('--force-with-lease=') &&
+  refreshWorkflow.includes('reviewDecision') &&
+  !refreshWorkflow.includes('git push --force origin'),
+  'feed refresh workflow safely reuses an open refresh PR',
+)
 
 const runGit = args => {
   const result = spawnSync('git', args, { cwd: repo, encoding: 'utf8' })
@@ -65,7 +75,7 @@ try {
     expectedRefreshSha: sourceSha,
   })
   assert.equal(receiptCheck.matches, true)
-  assert.deepEqual(receipt.feeds.map(feed => feed.path), ['feeds/amazon.json', 'feeds/anthropic.json', 'feeds/google.json', 'feeds/openai.json'])
+  assert.deepEqual(receipt.feeds.map(feed => feed.path), ['feeds/amazon.json', 'feeds/anthropic.json', 'feeds/cohere.json', 'feeds/google.json', 'feeds/mistral.json', 'feeds/openai.json'])
 
   const pending = createFeedRefreshReceipt({
     repoDir: repo,
@@ -98,7 +108,7 @@ try {
   assert.equal(health.refresh_run, refreshRun)
   assert.equal(health.refresh_commit, sourceSha)
   assert.equal(health.published_commit, sourceSha)
-  assert.deepEqual(health.feeds.map(feed => feed.publisher).sort(), ['amazon', 'anthropic', 'google', 'openai'])
+  assert.deepEqual(health.feeds.map(feed => feed.publisher).sort(), ['amazon', 'anthropic', 'cohere', 'google', 'mistral', 'openai'])
   for (const feed of health.feeds) {
     const name = `${feed.publisher}.json`
     const bytes = fs.readFileSync(path.join(output, 'feeds', name))

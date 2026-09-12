@@ -2,6 +2,7 @@
 // Smoke test for the reference checker. Time-stable assertions only:
 // o3-deep-research's shutdown (2026-07-23) is in the past forever, and
 // claude-opus-4-1's (2026-08-05) is either retiring or retired - both flag.
+import { validateFeed } from '../lib/validate-feed.mjs'
 import crypto from 'node:crypto'
 import { spawn, spawnSync } from 'node:child_process'
 import fs from 'node:fs'
@@ -10,10 +11,13 @@ import path from 'node:path'
 
 import { applyPlan } from '../lib/apply.mjs'
 import { color, colorEnabled } from '../lib/color.mjs'
-import { assertIsoDate, buildModelPattern, findingFromRef, lifecycleFor, loadFeeds } from '../lib/feeds.mjs'
+import { assertIsoDate, buildModelPattern, captureWindowFor, findingFromRef, lifecycleFor, loadFeeds } from '../lib/feeds.mjs'
 import { buildPlan } from '../lib/plan.mjs'
 import { formatCheck, formatSchedule } from '../lib/reports.mjs'
 import { parseDiffPath } from '../lib/scanner.mjs'
+import { validateDocument } from '../lib/validate-document.mjs'
+import { PROVIDERS, loadProviderSources, mergeFeed } from '../refresh/providers.mjs'
+import { mergeDistributions, parseAzureModelRetirementScheduleHtml } from '../refresh/distributors.mjs'
 
 const root = path.join(import.meta.dirname, '..')
 const run = (args, options = {}) => {
@@ -112,6 +116,7 @@ assert(['retiring', 'retired'].includes(byId('claude-opus-4-1-20250805')?.status
 assert(byId('gpt-5.6-sol')?.status === 'ok', 'gpt-5.6-sol is clean')
 assert(byId('gpt-5.6-sol')?.safe_until === null, 'OpenAI clean models make no forward claim without a policy floor')
 assert(byId('o3-deep-research-2025-06-26')?.replacement === 'gpt-5.6-sol', 'replacement surfaced')
+assert(!Object.hasOwn(byId('o3-deep-research-2025-06-26'), 'waiver'), 'non-waived findings omit waiver metadata')
 
 // Direct scope: the recommended direct-first CI mode leaves cloud/gateway-adjacent
 // refs for inventory/resolvers while still failing on direct or generic refs.
@@ -127,6 +132,21 @@ const bj = JSON.parse(b.out)
 const azure = bj.findings.find(f => f.id === 'o3-deep-research-2025-06-26')
 assert(azure?.via === 'azure-ai-foundry', 'azure distribution clock applied')
 assert(azure?.shutdown === '2026-12-26', 'azure shutdown date used')
+
+{
+  const azureProofDir = fs.mkdtempSync(path.join(os.tmpdir(), 'model-eol-azure-proof-'))
+  try {
+    fs.writeFileSync(path.join(azureProofDir, 'app.py'), 'model = "o3-deep-research-2025-06-26"\n')
+    const azureProof = run([azureProofDir, '--via', 'azure-ai-foundry', '--days', '90', '--json'])
+    const publisherProof = run([azureProofDir, '--days', '90', '--json'])
+    const azureFindings = JSON.parse(azureProof.out).findings
+    const publisherFindings = JSON.parse(publisherProof.out).findings
+    assert([0, 1].includes(azureProof.code) && azureFindings.length === 1 && azureFindings[0].via === 'azure-ai-foundry' && azureFindings[0].shutdown === '2026-12-26', 'dated research consumer uses regenerated Azure shutdown with --via and --days 90')
+    assert(publisherProof.code === 1 && publisherFindings.length === 1 && publisherFindings[0].via === 'publisher' && publisherFindings[0].shutdown === '2026-07-23', 'the same dated research consumer uses OpenAI shutdown without --via')
+  } finally {
+    fs.rmSync(azureProofDir, { recursive: true, force: true })
+  }
+}
 
 // A model-eol feed document is lifecycle data, not usage - scanning one would
 // flag every retired id it exists to describe (the repo's own feeds/ made the
@@ -216,11 +236,246 @@ assert(
   'CycloneDX has one component per unique publisher, canonical model, and requested lifecycle channel',
 )
 assert(property(cyclonedxComponent, 'model-eol:status') === 'retired', 'CycloneDX carries model-eol status property')
+assert(property(cyclonedxComponent, 'model-eol:waiver_active') === undefined, 'CycloneDX omits waiver properties when no occurrence matched a waiver')
 assert(cyclonedxComponent?.evidence?.occurrences.some(item => item.location.endsWith('direct.py#8')), 'CycloneDX carries model reference occurrences')
 assert(!cyclonedx.components.some(item => item.name === 'gpt-9-ultra-20990101'), 'CycloneDX omits candidate model references')
 assert(cyclonedx.metadata?.properties?.some(item => item.name === 'model-eol:generator' && item.value === 'model-eol/inventory-cyclonedx@0.1'), 'CycloneDX records explicit model-eol generator provenance')
 
 const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'model-eol-test-'))
+
+const anthropicAliasConsumerDir = path.join(tempRoot, 'anthropic-alias-consumer')
+const anthropicAliasConsumerFeeds = path.join(tempRoot, 'anthropic-alias-feeds')
+fs.mkdirSync(anthropicAliasConsumerDir)
+fs.mkdirSync(anthropicAliasConsumerFeeds)
+fs.writeFileSync(path.join(anthropicAliasConsumerDir, 'model.py'), '"claude-sonnet-4-5"')
+const anthropicAliasFixtures = path.join(root, 'refresh/test/fixture')
+const anthropicAliasSources = await loadProviderSources(PROVIDERS.anthropic, { fixtures: anthropicAliasFixtures, notice: () => {} })
+const anthropicAliasConsumerFeed = mergeFeed({ spec: 'model-eol/0.1', publisher: 'anthropic', models: [] }, {
+  ...anthropicAliasSources, provider: PROVIDERS.anthropic, generated: '2026-09-09T00:00:00Z', notice: () => {},
+}).feed
+fs.writeFileSync(path.join(anthropicAliasConsumerFeeds, 'anthropic.json'), JSON.stringify(anthropicAliasConsumerFeed))
+const anthropicAliasConsumer = run(['check', anthropicAliasConsumerDir, '--feeds', anthropicAliasConsumerFeeds, '--json'])
+const anthropicAliasFindings = JSON.parse(anthropicAliasConsumer.out).findings
+assert(anthropicAliasConsumer.code === 0 && anthropicAliasFindings.length === 1 && anthropicAliasFindings[0].id === 'claude-sonnet-4-5-20250929' && anthropicAliasFindings[0].matched === 'claude-sonnet-4-5', 'generated Anthropic temp feed resolves a file containing only the Sonnet alias to one canonical finding')
+const anthropicAliasInventory = run(['inventory', anthropicAliasConsumerDir, '--feeds', anthropicAliasConsumerFeeds, '--json'])
+const anthropicAliasReferences = JSON.parse(anthropicAliasInventory.out).model_references
+assert(anthropicAliasInventory.code === 0 && anthropicAliasReferences.length === 1 && anthropicAliasReferences[0].id === 'claude-sonnet-4-5-20250929' && anthropicAliasReferences[0].matched === 'claude-sonnet-4-5', 'inventory lists the bare Anthropic alias from the generated temp feed')
+const anthropicAzureRecords = parseAzureModelRetirementScheduleHtml(fs.readFileSync(path.join(anthropicAliasFixtures, 'azure-model-retirement-schedule.html'), 'utf8')).records
+const anthropicWithoutAliases = { ...anthropicAliasConsumerFeed, models: anthropicAliasConsumerFeed.models.map(({ aliases, ...model }) => model) }
+const anthropicAzureBefore = mergeDistributions([anthropicWithoutAliases], { via: 'azure-ai-foundry', records: anthropicAzureRecords })
+const anthropicAzureAfter = mergeDistributions([anthropicAliasConsumerFeed], { via: 'azure-ai-foundry', records: anthropicAzureRecords })
+for (const [alias, id] of [
+  ['claude-sonnet-4-5', 'claude-sonnet-4-5-20250929'],
+  ['claude-opus-4-5', 'claude-opus-4-5-20251101'],
+  ['claude-haiku-4-5', 'claude-haiku-4-5-20251001'],
+]) {
+  const model = anthropicAzureAfter.feeds[0].models.find(model => model.id === id)
+  assert(anthropicAzureBefore.unconfirmedDistributions.some(row => row.id === alias) && !anthropicAzureAfter.unconfirmedDistributions.some(row => row.id === alias || row.id === id) && model?.distributions?.some(distribution => distribution.via === 'azure-ai-foundry'), `Azure fixture row ${alias} binds and leaves the unconfirmed list after alias generation`)
+}
+
+const cohereConsumerDir = path.join(tempRoot, 'cohere-consumer')
+fs.mkdirSync(cohereConsumerDir)
+fs.writeFileSync(path.join(cohereConsumerDir, 'rerank.ts'), 'model: "rerank-english-v2.0"\n')
+const cohereConsumer = run([cohereConsumerDir, '--days', '90', '--json'])
+const cohereFindings = JSON.parse(cohereConsumer.out).findings
+assert(cohereConsumer.code === 1 && cohereFindings.length === 1 && cohereFindings[0].id === 'rerank-english-v2.0' && cohereFindings[0].shutdown === '2025-04-30' && cohereFindings[0].publisher === 'cohere', 'bundled Cohere feed reports the published Rerank v2.0 shutdown')
+const cohereAliasDir = path.join(tempRoot, 'cohere-alias-consumer')
+fs.mkdirSync(cohereAliasDir)
+fs.writeFileSync(path.join(cohereAliasDir, 'command.ts'), '"command-r"\n')
+const cohereAliasConsumer = run([cohereAliasDir, '--days', '90', '--json'])
+const cohereAliasFindings = JSON.parse(cohereAliasConsumer.out).findings
+const cohereResolvedAlias = loadFeeds(path.join(root, 'feeds')).entries.get(cohereAliasFindings[0]?.matched)?.entry
+assert(cohereAliasConsumer.code === 0 && cohereAliasFindings.length === 1 && cohereAliasFindings[0].id === 'command-r-03-2024' && cohereAliasFindings[0].shutdown === null && cohereAliasFindings[0].status === 'watch' && cohereAliasFindings[0].publisher === 'cohere' && cohereResolvedAlias?.id === 'command-r-03-2024' && cohereResolvedAlias?.announced === '2025-09-15' && !Object.hasOwn(cohereResolvedAlias, 'shutdown'), 'bundled Cohere alias resolves to its canonical announcement without a shutdown date')
+
+const mistralConsumerDir = path.join(tempRoot, 'mistral-consumer')
+fs.mkdirSync(mistralConsumerDir)
+const mistralConsumerFile = path.join(mistralConsumerDir, 'app.ts')
+fs.writeFileSync(mistralConsumerFile, 'model: "mistral-medium-2508"\n')
+const mistralConsumer = run([mistralConsumerDir, '--days', '90', '--json'])
+const mistralFindings = JSON.parse(mistralConsumer.out).findings
+assert(mistralConsumer.code === 1 && mistralFindings.length === 1 && mistralFindings[0].id === 'mistral-medium-2508' && mistralFindings[0].shutdown === '2026-08-31' && mistralFindings[0].status === 'retired', 'bundled Mistral feed reports Medium 2508 as retired with its published shutdown')
+const mistralEndpointFixture = JSON.parse(fs.readFileSync(path.join(root, 'refresh/test/fixture/mistral-models.json'), 'utf8'))
+const mistralAlias = mistralEndpointFixture.data.find(model => model.id === 'mistral-medium-2508').aliases[0]
+const mistralBundledAlias = loadFeeds(path.join(root, 'feeds')).entries.get(mistralAlias)
+if (mistralBundledAlias) {
+  fs.writeFileSync(mistralConsumerFile, `model: "${mistralAlias}"\n`)
+  const aliasConsumer = run([mistralConsumerDir, '--days', '90', '--json'])
+  const aliasFindings = JSON.parse(aliasConsumer.out).findings
+  assert(aliasFindings.length === 1 && aliasFindings[0].id === mistralBundledAlias.entry.id && aliasFindings[0].publisher === 'mistral' && aliasFindings[0].shutdown === (mistralBundledAlias.entry.shutdown ?? null), 'bundled Mistral endpoint alias resolves to its canonical model when present')
+}
+
+const waiverDir = path.join(tempRoot, 'waivers')
+const waiverConfigPath = path.join(tempRoot, 'waiver-config.json')
+fs.mkdirSync(path.join(waiverDir, 'services', 'legacy'), { recursive: true })
+fs.mkdirSync(path.join(waiverDir, 'services', 'current'), { recursive: true })
+fs.writeFileSync(path.join(waiverDir, 'services', 'legacy', 'app.py'), 'from openai import OpenAI\nMODEL = "o3-deep-research"\n')
+fs.writeFileSync(path.join(waiverDir, 'services', 'current', 'app.py'), 'from openai import OpenAI\nMODEL = "o3-deep-research"\n')
+assert(spawnSync('git', ['init', '-q'], { cwd: waiverDir }).status === 0, 'waiver fixture initializes a git root')
+const utcDate = offset => {
+  const date = new Date()
+  date.setUTCHours(0, 0, 0, 0)
+  date.setUTCDate(date.getUTCDate() + offset)
+  return date.toISOString().slice(0, 10)
+}
+const todayDate = utcDate(0)
+const activeExpiry = utcDate(1)
+const baseWaiver = {
+  model: 'o3-deep-research-2025-06-26',
+  paths: ['services/legacy/**'],
+  reason: 'Vendor contract pins this model until migration.',
+  owner: '@platform-team',
+  expires: activeExpiry,
+}
+const writeWaiverConfig = value => fs.writeFileSync(waiverConfigPath, JSON.stringify(value, null, 2))
+writeWaiverConfig({
+  ignore: { paths: ['services/current/**'] },
+  waivers: [baseWaiver],
+})
+const activeWaiverCheck = run(['check', waiverDir, '--config', waiverConfigPath, '--days', '90', '--scope', 'all', '--json'])
+const activeWaiverDocument = JSON.parse(activeWaiverCheck.out)
+const activeWaivedFinding = activeWaiverDocument.findings[0]
+assert(activeWaiverCheck.code === 0 && activeWaiverDocument.findings.length === 1, 'only active-waived retired findings produce a clear check exit')
+assert(activeWaivedFinding?.matched === 'o3-deep-research' && activeWaivedFinding.waiver?.active === true, 'a canonical waiver matches every alias while preserving the finding')
+assert(activeWaivedFinding.waiver.owner === '@platform-team' && activeWaivedFinding.waiver.expires === activeExpiry, 'active findings expose waiver ownership and expiry')
+const activeWaiverText = run(['check', waiverDir, '--config', waiverConfigPath, '--days', '90', '--scope', 'all'])
+assert(activeWaiverText.out.includes(`waived until ${activeExpiry} by @platform-team: Vendor contract pins this model until migration.`), 'human check output prints the active waiver marker')
+
+const activeWaiverInventory = JSON.parse(run(['inventory', waiverDir, '--config', waiverConfigPath, '--days', '90', '--scope', 'all', '--json']).out)
+const activeWaiverSchedule = JSON.parse(run(['schedule', waiverDir, '--config', waiverConfigPath, '--days', '90', '--scope', 'all', '--json']).out)
+const activeWaiverAlertRun = run(['alert', waiverDir, '--config', waiverConfigPath, '--days', '90', '--scope', 'all', '--json'])
+const activeWaiverAlert = JSON.parse(activeWaiverAlertRun.out)
+const activeWaiverPlan = JSON.parse(run(['plan', waiverDir, '--config', waiverConfigPath, '--days', '90', '--scope', 'all']).out)
+assert(activeWaiverInventory.model_references[0]?.waiver?.active === true && activeWaiverInventory.summary.retired_or_retiring === 0, 'inventory keeps active-waived findings and removes them from actionable severity totals')
+assert(activeWaiverSchedule.items[0]?.waiver?.active === true, 'schedule keeps active-waived findings')
+assert(activeWaiverAlertRun.code === 0 && activeWaiverAlert.errors.length === 0 && activeWaiverAlert.warnings.some(item => item.waiver?.active === true && item.status === 'retired'), 'alert emits active-waived retired findings as warnings and exits clear')
+assert(activeWaiverPlan.items.length === 0 && activeWaiverPlan.issues.some(item => item.reason === 'waived' && item.waiver?.active === true), 'plan reports active waivers without producing migration items')
+const activeWaiverBadge = JSON.parse(run(['alert', waiverDir, '--config', waiverConfigPath, '--days', '90', '--scope', 'all', '--format', 'badge']).out)
+assert(activeWaiverBadge.message === 'clear' && activeWaiverBadge.color === 'brightgreen', 'badge counts exclude active-waived findings')
+const activeWaiverCycloneDx = JSON.parse(run(['inventory', waiverDir, '--config', waiverConfigPath, '--days', '90', '--scope', 'all', '--format', 'cyclonedx']).out)
+const activeWaiverComponent = activeWaiverCycloneDx.components.find(component => component.name === 'o3-deep-research-2025-06-26')
+assert(property(activeWaiverComponent, 'model-eol:waiver_active') === 'true' && property(activeWaiverComponent, 'model-eol:waiver_owner') === '@platform-team' && property(activeWaiverComponent, 'model-eol:waiver_expires') === activeExpiry, 'CycloneDX properties expose active waiver suppression')
+
+writeWaiverConfig({
+  ignore: { paths: ['services/current/**'] },
+  waivers: [{ ...baseWaiver, expires: todayDate }],
+})
+const expiredWaiverCheck = run(['check', waiverDir, '--config', waiverConfigPath, '--days', '90', '--scope', 'all', '--json'])
+const expiredWaivedFinding = JSON.parse(expiredWaiverCheck.out).findings[0]
+assert(expiredWaiverCheck.code === 1 && expiredWaivedFinding?.waiver?.active === false && expiredWaivedFinding.waiver.expires === todayDate, 'a waiver is inactive on its exact expiry date and the finding reactivates')
+const expiredWaiverInventory = JSON.parse(run(['inventory', waiverDir, '--config', waiverConfigPath, '--days', '90', '--scope', 'all', '--json']).out)
+const expiredWaiverSchedule = JSON.parse(run(['schedule', waiverDir, '--config', waiverConfigPath, '--days', '90', '--scope', 'all', '--json']).out)
+const expiredWaiverAlert = JSON.parse(run(['alert', waiverDir, '--config', waiverConfigPath, '--days', '90', '--scope', 'all', '--json']).out)
+const expiredWaiverPlan = JSON.parse(run(['plan', waiverDir, '--config', waiverConfigPath, '--days', '90', '--scope', 'all']).out)
+assert(expiredWaiverInventory.model_references[0]?.waiver?.active === false, 'inventory preserves an expired matched waiver')
+assert(expiredWaiverSchedule.items[0]?.waiver?.active === false, 'schedule preserves an expired matched waiver')
+assert(expiredWaiverAlert.errors[0]?.waiver?.active === false, 'alert preserves an expired matched waiver')
+assert(expiredWaiverPlan.items[0]?.waiver?.active === false, 'plan preserves an expired matched waiver')
+const expiredWaiverCycloneDx = JSON.parse(run(['inventory', waiverDir, '--config', waiverConfigPath, '--days', '90', '--scope', 'all', '--format', 'cyclonedx']).out)
+const expiredWaiverComponent = expiredWaiverCycloneDx.components.find(component => component.name === 'o3-deep-research-2025-06-26')
+assert(property(expiredWaiverComponent, 'model-eol:waiver_active') === 'false' && property(expiredWaiverComponent, 'model-eol:waiver_owner') === '@platform-team' && property(expiredWaiverComponent, 'model-eol:waiver_expires') === todayDate && property(expiredWaiverComponent, 'model-eol:waiver_reason') === baseWaiver.reason, 'CycloneDX preserves one expired waiver with its audit metadata')
+const expiredWaiverText = run(['check', waiverDir, '--config', waiverConfigPath, '--days', '90', '--scope', 'all'])
+assert(expiredWaiverText.out.includes(`waiver expired on ${todayDate}; owner @platform-team`), 'human check output explains an expired waiver')
+
+writeWaiverConfig({ waivers: [{ ...baseWaiver, expires: todayDate }] })
+const mixedExpiredCycloneDx = JSON.parse(run(['inventory', waiverDir, '--config', waiverConfigPath, '--days', '90', '--scope', 'all', '--format', 'cyclonedx']).out)
+const mixedExpiredComponent = mixedExpiredCycloneDx.components.find(component => component.name === 'o3-deep-research-2025-06-26')
+assert(property(mixedExpiredComponent, 'model-eol:waiver_active') === 'false' && property(mixedExpiredComponent, 'model-eol:waiver_owner') === '@platform-team' && property(mixedExpiredComponent, 'model-eol:waiver_expires') === todayDate && property(mixedExpiredComponent, 'model-eol:waiver_reason') === baseWaiver.reason, 'CycloneDX preserves expired waiver metadata when other occurrences are unmatched')
+
+writeWaiverConfig({
+  waivers: [
+    baseWaiver,
+    { ...baseWaiver, paths: ['services/current/**'], reason: 'The current path waiver expired.', owner: '@current-team', expires: todayDate },
+  ],
+})
+const activeExpiredCycloneDx = JSON.parse(run(['inventory', waiverDir, '--config', waiverConfigPath, '--days', '90', '--scope', 'all', '--format', 'cyclonedx']).out)
+const activeExpiredComponent = activeExpiredCycloneDx.components.find(component => component.name === 'o3-deep-research-2025-06-26')
+assert(property(activeExpiredComponent, 'model-eol:waiver_active') === 'partial' && property(activeExpiredComponent, 'model-eol:waiver_owner') === undefined && property(activeExpiredComponent, 'model-eol:waiver_expires') === undefined && property(activeExpiredComponent, 'model-eol:waiver_reason') === undefined, 'CycloneDX marks mixed active and expired occurrence waivers as partial')
+
+writeWaiverConfig({ waivers: [baseWaiver] })
+const pathScopedWaivers = JSON.parse(run(['check', waiverDir, '--config', waiverConfigPath, '--days', '90', '--scope', 'all', '--json']).out).findings
+const legacyPathFinding = pathScopedWaivers.find(item => item.file.endsWith('services/legacy/app.py'))
+const currentPathFinding = pathScopedWaivers.find(item => item.file.endsWith('services/current/app.py'))
+assert(legacyPathFinding?.waiver?.active === true && !Object.hasOwn(currentPathFinding, 'waiver'), 'waiver paths suppress only matching repository paths')
+
+writeWaiverConfig({
+  overrides: [{ paths: ['services/legacy/**'], waivers: [{ ...baseWaiver, paths: undefined }] }],
+})
+const overrideWaivers = JSON.parse(run(['check', waiverDir, '--config', waiverConfigPath, '--days', '90', '--scope', 'all', '--json']).out).findings
+assert(overrideWaivers.find(item => item.file.endsWith('services/legacy/app.py'))?.waiver?.active === true && !Object.hasOwn(overrideWaivers.find(item => item.file.endsWith('services/current/app.py')), 'waiver'), 'path overrides accept the same waiver shape and scope it to matching files')
+
+writeWaiverConfig({
+  via: 'azure-ai-foundry',
+  ignore: { paths: ['services/current/**'] },
+  waivers: [{ ...baseWaiver, via: 'aws-bedrock' }],
+})
+const mismatchedViaFinding = JSON.parse(run(['check', waiverDir, '--config', waiverConfigPath, '--days', '365', '--scope', 'all', '--json']).out).findings[0]
+assert(mismatchedViaFinding?.via === 'azure-ai-foundry' && !Object.hasOwn(mismatchedViaFinding, 'waiver'), 'a distributor-scoped waiver does not match a different finding clock')
+writeWaiverConfig({
+  via: 'azure-ai-foundry',
+  ignore: { paths: ['services/current/**'] },
+  waivers: [{ ...baseWaiver, via: 'azure-ai-foundry' }],
+})
+const matchingViaRun = run(['check', waiverDir, '--config', waiverConfigPath, '--days', '365', '--scope', 'all', '--json'])
+assert(matchingViaRun.code === 0 && JSON.parse(matchingViaRun.out).findings[0]?.waiver?.active === true, 'a distributor-scoped waiver matches the finding clock exactly')
+
+writeWaiverConfig({
+  ignore: { paths: ['services/current/**'] },
+  waivers: [{ ...baseWaiver, via: 'publisher' }],
+})
+const publisherWaiverRun = run(['check', waiverDir, '--config', waiverConfigPath, '--days', '90', '--scope', 'all', '--json'])
+const publisherWaiverFinding = JSON.parse(publisherWaiverRun.out).findings[0]
+assert(publisherWaiverRun.code === 0 && publisherWaiverFinding?.via === 'publisher' && publisherWaiverFinding.waiver?.active === true, 'a publisher-scoped waiver matches the direct publisher clock')
+
+writeWaiverConfig({
+  via: 'vertex-ai',
+  ignore: { paths: ['services/current/**'] },
+  waivers: [{ ...baseWaiver, via: 'publisher-fallback' }],
+})
+const fallbackWaiverRun = run(['check', waiverDir, '--config', waiverConfigPath, '--days', '90', '--scope', 'all', '--json'])
+const fallbackWaiverFinding = JSON.parse(fallbackWaiverRun.out).findings[0]
+assert(fallbackWaiverRun.code === 0 && fallbackWaiverFinding?.via === 'publisher-fallback' && fallbackWaiverFinding.waiver?.active === true, 'a publisher-fallback waiver matches an explicit publisher fallback clock')
+
+writeWaiverConfig({
+  ignore: { paths: ['services/current/**'] },
+  waivers: [{ ...baseWaiver, via: 'private-mystery-channel' }],
+})
+const unknownWaiverViaRun = run(['check', waiverDir, '--config', waiverConfigPath, '--days', '90', '--scope', 'all', '--json'])
+assert(unknownWaiverViaRun.code === 2 && unknownWaiverViaRun.err.includes('unknown lifecycle channel "private-mystery-channel"'), 'waivers still reject unknown lifecycle channel names')
+
+writeWaiverConfig({
+  ignore: { paths: ['services/current/**'] },
+  waivers: [
+    { ...baseWaiver, owner: '@expired-owner', expires: todayDate },
+    { ...baseWaiver, owner: '@active-owner' },
+  ],
+})
+const overlappingWithExpired = JSON.parse(run(['check', waiverDir, '--config', waiverConfigPath, '--days', '90', '--scope', 'all', '--json']).out).findings[0]
+assert(overlappingWithExpired?.waiver?.active === true && overlappingWithExpired.waiver.owner === '@active-owner', 'the first active waiver wins when an earlier matching waiver is expired')
+writeWaiverConfig({
+  ignore: { paths: ['services/current/**'] },
+  waivers: [
+    { ...baseWaiver, owner: '@first-active' },
+    { ...baseWaiver, owner: '@second-active' },
+  ],
+})
+const overlappingActive = JSON.parse(run(['check', waiverDir, '--config', waiverConfigPath, '--days', '90', '--scope', 'all', '--json']).out).findings[0]
+assert(overlappingActive?.waiver?.owner === '@first-active', 'config order selects the first matching active waiver')
+
+const malformedWaiverCases = [
+  ['unknown waiver key', { ...baseWaiver, ticket: 'MIG-1' }, 'ticket'],
+  ['missing waiver owner', Object.fromEntries(Object.entries(baseWaiver).filter(([key]) => key !== 'owner')), 'owner'],
+  ['impossible waiver date', { ...baseWaiver, expires: '2026-02-30' }, 'date'],
+  ['relative waiver duration', { ...baseWaiver, expires: '90d' }, 'format date'],
+  ['invalid waiver paths type', { ...baseWaiver, paths: 'services/**' }, 'paths'],
+]
+for (const [label, waiver, diagnostic] of malformedWaiverCases) {
+  writeWaiverConfig({ waivers: [waiver] })
+  const result = run(['validate', waiverConfigPath, '--type', 'config'])
+  assert(result.code === 2 && result.err.includes(diagnostic), `${label} fails closed during public config validation`)
+}
+writeWaiverConfig({ waivers: Array.from({ length: 501 }, () => baseWaiver) })
+const excessiveWaivers = run(['validate', waiverConfigPath, '--type', 'config'])
+assert(excessiveWaivers.code === 2 && excessiveWaivers.err.includes('500'), 'configs reject more than 500 waivers')
 
 const artifactDir = path.join(tempRoot, 'generated-artifacts')
 fs.mkdirSync(path.join(artifactDir, 'baml_src'), { recursive: true })
@@ -307,7 +562,9 @@ assert(automaticConfigJson.scanned_files === 1 && automaticConfigJson.scan_notes
 const configuredPlan = run(['plan', repositoryConfigSrc])
 const configuredPlanJson = JSON.parse(configuredPlan.out)
 assert(configuredPlan.code === 0 && configuredPlanJson.scan_notes.length === 0, 'git-root config is discovered for a subdirectory target and ignored large files do not block plan')
-assert(configuredPlanJson.items.length === 0 && configuredPlanJson.issues.length === 0, 'model ignores apply consistently to migration plans')
+const configuredPlanIgnored = ['o3-deep-research-2025-06-26', 'o3-deep-research', 'gpt-9-config-ignore']
+assert(configuredPlanJson.items.length === 0 && !configuredPlanJson.issues.some(issue => configuredPlanIgnored.includes(issue.id) || configuredPlanIgnored.includes(issue.matched)), 'model ignores apply consistently to migration plans')
+assert(configuredPlanJson.issues.every(issue => issue.id === 'gpt-5.6-sol' && issue.reason === 'outside-threshold'), 'the unignored current model appears only as an informational scheduled issue')
 
 const explicitConfigFile = path.join(tempRoot, 'explicit-model-eol.json')
 fs.writeFileSync(explicitConfigFile, JSON.stringify({
@@ -984,28 +1241,258 @@ assert(statusOnlyHuman.code === 1 && statusOnlyHuman.out.includes('RETIRED (shut
 const statusOnlyPlan = JSON.parse(run(['plan', statusOnlyDir, '--feeds', statusOnlyFeeds, '--via', 'custom-hub']).out)
 assert(statusOnlyPlan.items.length === 0 && statusOnlyPlan.issues.some(issue => issue.reason === 'shutdown-date-unavailable'), 'status-only retirement remains non-patchable until a shutdown date is known')
 
-const earliestFinding = findingFromRef({
+const captureDir = path.join(tempRoot, 'capture-window')
+const captureFeeds = path.join(captureDir, 'feeds')
+const captureDistributions = [
+  { via: 'vertex-ai', shutdown: '2999-11-14', date_precision: 'tentative', status: 'active' },
+  { via: 'aws-bedrock', shutdown: '2999-10-14', date_precision: 'exact', status: 'extended-access' },
+  { via: 'retired-channel', shutdown: '2999-12-14', status: 'retired' },
+  { via: 'undated-channel', status: 'active' },
+  { via: 'expired-channel', shutdown: '2000-01-01' },
+  { via: 'today-channel', shutdown: new Date().toISOString().slice(0, 10) },
+]
+fs.mkdirSync(captureFeeds, { recursive: true })
+fs.writeFileSync(path.join(captureDir, 'app.py'), 'MODEL = "capture-retired-model"\nFUTURE_MODEL = "capture-future-model"\nOK_MODEL = "capture-ok-model"\nWATCH_MODEL = "capture-watch-model"\n')
+const captureEntries = [
+  { id: 'capture-retired-model', shutdown: '2000-01-01', distributions: captureDistributions },
+  { id: 'capture-future-model', shutdown: '2998-01-01', date_precision: 'earliest', distributions: captureDistributions },
+  { id: 'capture-ok-model', distributions: captureDistributions },
+  { id: 'capture-watch-model', announced: '2000-01-01', distributions: captureDistributions },
+]
+fs.writeFileSync(path.join(captureFeeds, 'openai.json'), JSON.stringify({
+  spec: 'model-eol/0.1',
+  publisher: 'openai',
+  generated: '2026-08-01T00:00:00Z',
+  source: 'https://example.invalid/capture-window',
+  models: captureEntries,
+}))
+const captureArgs = ['check', captureDir, '--feeds', captureFeeds]
+const captureFinding = (id, options) => findingFromRef({
+  file: 'app.py',
+  line: 1,
+  matched: id,
+  entry: captureEntries.find(entry => entry.id === id),
+  publisher: 'openai',
+  usage: 'direct-api',
+  resolved_provider: 'openai',
+  confidence: 'high',
+}, { days: 90, ...options })
+const captureAlternatives = [
+  { via: 'aws-bedrock', until: '2999-10-14', date_precision: 'exact', status: 'extended-access' },
+  { via: 'vertex-ai', until: '2999-11-14', date_precision: 'tentative', status: 'active' },
+]
+const captureRetired = captureFinding('capture-retired-model')
+assert(captureRetired.status === 'retired' && captureRetired.capture.until === null && captureRetired.capture.date_precision === null && captureRetired.capture.via === 'publisher', 'retired publisher capture has no remaining date or precision')
+assert(JSON.stringify(captureRetired.capture.alternatives) === JSON.stringify(captureAlternatives), 'capture alternatives sort by date and exclude retired, undated, expired, and same-day clocks')
+assert(captureFinding('capture-ok-model').capture === null, 'ok findings have no capture window despite distributor dates')
+assert(captureFinding('capture-watch-model').capture === null, 'watch findings have no capture window despite distributor dates')
+const captureBedrock = captureFinding('capture-retired-model', { via: 'aws-bedrock' }).capture
+assert(captureBedrock.until === '2999-10-14' && captureBedrock.date_precision === 'exact' && captureBedrock.via === 'aws-bedrock', 'distributor capture uses its own feed date and precision')
+assert(JSON.stringify(captureBedrock.alternatives) === JSON.stringify(captureAlternatives.slice(1)), 'distributor alternatives exclude the applied clock and retired publisher')
+const captureLivePublisher = captureFinding('capture-future-model', { via: 'aws-bedrock' }).capture.alternatives[0]
+assert(JSON.stringify(captureLivePublisher) === JSON.stringify({ via: 'publisher', until: '2998-01-01', date_precision: 'earliest', status: null }), 'distributor capture includes a later-than-today publisher clock with its own precision')
+const captureInsideThreshold = captureFinding('capture-future-model', { days: 1000000 })
+assert(captureInsideThreshold.status === 'retiring' && captureInsideThreshold.capture.until === captureInsideThreshold.shutdown, 'retiring capture preserves the shutdown date inside the threshold')
+const captureFallback = captureFinding('capture-retired-model', { via: 'azure-ai-foundry' }).capture
+assert(captureFallback.via === 'publisher-fallback' && JSON.stringify(captureFallback.alternatives) === JSON.stringify(captureAlternatives), 'publisher fallback considers all distributor clocks')
+const captureHumanRun = run(captureArgs)
+assert(captureHumanRun.code === 1 && captureHumanRun.out.includes('  [still answers via aws-bedrock until 2999-10-14, via vertex-ai at least until 2999-11-14]'), 'retired human output renders one bracket with exact and tentative capture alternatives')
+assert(captureHumanRun.out.split('\n').some(line => line.includes('capture-future-model') && line.includes('scheduled') && !line.includes('[still answers')), 'scheduled human findings omit capture alternatives')
+const captureRetiringHuman = run([...captureArgs, '--via', 'aws-bedrock', '--days', '1000000']).out
+assert(captureRetiringHuman.includes('[still answers via publisher at least until 2998-01-01, via vertex-ai at least until 2999-11-14]'), 'retiring human output renders earliest publisher and tentative distributor alternatives')
+const captureTies = captureWindowFor({ distributions: [
+  { via: 'z-channel', shutdown: '2999-01-01' },
+  { via: 'a-channel', shutdown: '2999-01-01' },
+  { via: 'invalid-channel', shutdown: 'unknown' },
+] }, { status: 'retired', shutdown: null, via: 'publisher' }, { today: testToday })
+assert(captureTies.alternatives.map(row => row.via).join(',') === 'a-channel,z-channel' && captureTies.alternatives.every(row => row.date_precision === null && row.status === null), 'capture ties sort by via, preserve unknown precision/status, and reject non-date strings')
+const captureNullPrecisionHuman = formatCheck({ findings: [{ ...captureRetired, capture: captureTies }], bad: [captureRetired], scannedFiles: 1, days: 90, scope: 'all' })
+assert(captureNullPrecisionHuman.includes('[still answers via a-channel until 2999-01-01, via z-channel until 2999-01-01]'), 'null capture precision uses until wording')
+for (const [label, args] of [['direct', captureArgs], ['distributor', [...captureArgs, '--via', 'aws-bedrock']], ['retiring', [...captureArgs, '--days', '1000000']]]) {
+  const document = JSON.parse(run([...args, '--json']).out)
+  assert(document.findings.length > 0 && document.findings.every(finding => !Object.hasOwn(finding, 'capture')), `${label} check JSON keeps capture out of the 0.1 document`)
+  assert(validateDocument(document, { type: 'check' }).errors.length === 0, `${label} capture check output validates against the public schema`)
+}
+const captureInventory = JSON.parse(run(['inventory', captureDir, '--feeds', captureFeeds, '--json']).out)
+const captureSchedule = JSON.parse(run(['schedule', captureDir, '--feeds', captureFeeds, '--json']).out)
+const capturePlan = JSON.parse(run(['plan', captureDir, '--feeds', captureFeeds]).out)
+assert([...captureInventory.model_references, ...captureSchedule.items, ...capturePlan.items, ...capturePlan.issues].every(item => !Object.hasOwn(item, 'capture')), 'capture does not extend inventory, schedule, or plan output')
+
+const tentativePolicy = { min_notice_days: 60, source: 'https://example.invalid/anthropic' }
+const tentativeToday = new Date('2026-09-03T00:00:00Z')
+const tentativeFloorFinding = findingFromRef({
   file: 'fixture.py',
   line: 1,
-  matched: 'earliest-model',
-  entry: { id: 'earliest-model', shutdown: '2026-08-20', date_precision: 'earliest' },
+  matched: 'tentative-floor-model',
+  entry: { id: 'tentative-floor-model', shutdown: '2026-09-29', date_precision: 'tentative' },
+  publisher: 'anthropic',
+  usage: 'model-reference',
+  resolved_provider: 'anthropic',
+  confidence: 'medium',
+  policy: tentativePolicy,
+  generated: '2026-08-18T00:00:00Z',
+}, { days: 30, today: tentativeToday })
+assert(tentativeFloorFinding.status === 'scheduled' && tentativeFloorFinding.date_precision === 'tentative', 'a tentative publisher floor remains scheduled inside the threshold')
+assert(tentativeFloorFinding.safe_until === '2026-10-17' && tentativeFloorFinding.days === 44, 'a tentative floor uses the later policy date for safe_until and days')
+const pastTentativeFloor = lifecycleFor({
+  shutdown: '2026-08-01',
+  date_precision: 'tentative',
+}, {
+  days: 30,
+  today: tentativeToday,
+  policy: tentativePolicy,
+  generated: '2026-08-18T00:00:00Z',
+})
+assert(pastTentativeFloor.status === 'scheduled' && pastTentativeFloor.shutdown === '2026-08-01' && pastTentativeFloor.safe_until === '2026-10-17', 'a past tentative publisher floor never becomes retired')
+assert(pastTentativeFloor.days === 44, 'a past tentative floor reports days from the later policy date')
+const distributorTentativeFloor = lifecycleFor({
+  id: 'distributor-tentative-model',
+  distributions: [{ via: 'aws-bedrock', shutdown: '2026-09-01', date_precision: 'tentative' }],
+}, {
+  days: 30,
+  via: 'aws-bedrock',
+  today: tentativeToday,
+  policy: tentativePolicy,
+  generated: '2026-08-18T00:00:00Z',
+})
+assert(distributorTentativeFloor.status === 'scheduled' && distributorTentativeFloor.via === 'aws-bedrock', 'a distributor tentative floor remains scheduled on its own clock')
+assert(distributorTentativeFloor.safe_until === '2026-09-01' && distributorTentativeFloor.days === -2, 'publisher notice policy never extends a distributor tentative floor')
+const pastEarliestFinding = findingFromRef({
+  file: 'fixture.py',
+  line: 1,
+  matched: 'past-earliest-model',
+  entry: { id: 'past-earliest-model', shutdown: '2026-06-01', date_precision: 'earliest' },
   publisher: 'google',
   usage: 'model-reference',
   resolved_provider: 'google',
   confidence: 'medium',
-}, { days: 30, today: testToday })
-assert(earliestFinding.date_precision === 'earliest', 'findings carry date precision')
-const earliestCheck = formatCheck({ findings: [earliestFinding], bad: [earliestFinding], scannedFiles: 1, days: 30, scope: 'all' })
-assert(earliestCheck.includes('no earlier than 2026-08-20'), 'human check output renders earliest shutdown as a lower bound')
+}, { days: 30, today: tentativeToday })
+assert(pastEarliestFinding.status === 'retired', 'a Google earliest date without an announcement becomes retired after its date')
+const earliestFinding = findingFromRef({
+  file: 'fixture.py',
+  line: 1,
+  matched: 'earliest-model',
+  entry: { id: 'earliest-model', shutdown: '2026-09-29', date_precision: 'earliest' },
+  publisher: 'google',
+  usage: 'model-reference',
+  resolved_provider: 'google',
+  confidence: 'medium',
+}, { days: 30, today: tentativeToday })
+assert(earliestFinding.status === 'retiring', 'an earliest date without an announcement becomes retiring inside the threshold')
+const distributorEarliest = lifecycleFor({
+  distributions: [{ via: 'test-channel', shutdown: '2026-09-29', date_precision: 'earliest' }],
+}, { days: 30, via: 'test-channel', today: tentativeToday })
+assert(distributorEarliest.status === 'retiring', 'a distributor earliest date keeps threshold behavior without an announcement')
+const distributorTentative = lifecycleFor({
+  announced: '2026-07-01',
+  distributions: [{ via: 'test-channel', shutdown: '2026-08-01', date_precision: 'tentative' }],
+}, { days: 30, via: 'test-channel', today: tentativeToday, policy: tentativePolicy, generated: '2026-08-18T00:00:00Z' })
+assert(distributorTentative.status === 'scheduled' && distributorTentative.via === 'test-channel', 'a tentative distributor clock ignores a publisher announcement')
+const announcedPastTentative = lifecycleFor({
+  announced: '2026-07-01',
+  shutdown: '2026-08-01',
+  date_precision: 'tentative',
+}, { days: 30, today: tentativeToday, policy: tentativePolicy, generated: '2026-08-18T00:00:00Z' })
+assert(announcedPastTentative.status === 'retired', 'an announced tentative publisher date cannot bypass retirement')
+const announcedDistributorTentative = lifecycleFor({
+  distributions: [{ via: 'test-channel', announced: '2026-07-01', shutdown: '2026-08-01', date_precision: 'tentative' }],
+}, { days: 30, via: 'test-channel', today: tentativeToday, policy: tentativePolicy, generated: '2026-08-18T00:00:00Z' })
+assert(announcedDistributorTentative.status === 'retired', 'an announced tentative distributor date cannot bypass retirement')
+const retiredDistributorTentative = lifecycleFor({
+  distributions: [{ via: 'test-channel', shutdown: '2026-09-29', date_precision: 'tentative', status: 'retired' }],
+}, { days: 30, via: 'test-channel', today: tentativeToday, policy: tentativePolicy, generated: '2026-08-18T00:00:00Z' })
+assert(retiredDistributorTentative.status === 'retired', 'retired distributor status overrides tentative precision')
+const tentativeCheck = formatCheck({ findings: [tentativeFloorFinding], bad: [], scannedFiles: 1, days: 30, scope: 'all' })
+const tentativeHumanText = 'scheduled - tentative, not announced: not sooner than 2026-09-29, guaranteed until 2026-10-17 by anthropic policy'
+assert(tentativeCheck.includes(tentativeHumanText), 'human check output identifies the tentative unannounced floor')
+const distributorTentativeFinding = findingFromRef({
+  file: 'fixture.py',
+  line: 1,
+  matched: 'distributor-tentative-model',
+  entry: { id: 'distributor-tentative-model', distributions: [{ via: 'aws-bedrock', shutdown: '2026-09-01', date_precision: 'tentative' }] },
+  publisher: 'anthropic',
+  usage: 'model-reference',
+  resolved_provider: 'anthropic',
+  confidence: 'medium',
+  policy: tentativePolicy,
+  generated: '2026-08-18T00:00:00Z',
+}, { days: 30, via: 'aws-bedrock', today: tentativeToday })
+const distributorTentativeCheck = formatCheck({ findings: [distributorTentativeFinding], bad: [], scannedFiles: 1, days: 30, scope: 'all' })
+assert(distributorTentativeCheck.includes('scheduled - tentative, not announced: not sooner than 2026-09-01') && !distributorTentativeCheck.includes('policy'), 'a distributor tentative floor never cites publisher policy')
+const tentativeFeedBase = { spec: 'model-eol/0.1', publisher: 'anthropic', generated: '2026-09-03T00:00:00Z', source: 'https://example.invalid/anthropic' }
+const bedrockFloorDir = path.join(tempRoot, 'bedrock-tentative-floor')
+const bedrockFloorFeeds = path.join(bedrockFloorDir, 'feeds')
+fs.mkdirSync(bedrockFloorFeeds, { recursive: true })
+fs.writeFileSync(path.join(bedrockFloorDir, 'app.py'), 'MODEL = "bedrock-floor-model"\n')
+for (const shutdown of ['2026-08-01', '2026-09-29']) {
+  fs.writeFileSync(path.join(bedrockFloorFeeds, 'anthropic.json'), JSON.stringify({
+    ...tentativeFeedBase,
+    models: [{ id: 'bedrock-floor-model', distributions: [{ via: 'aws-bedrock', shutdown, date_precision: 'tentative', status: 'active', source: 'https://example.invalid/model-card.html' }] }],
+  }))
+  const args = ['check', bedrockFloorDir, '--feeds', bedrockFloorFeeds, '--via', 'aws-bedrock', '--days', '30']
+  const json = run([...args, '--json'])
+  const finding = JSON.parse(json.out).findings.find(item => item.id === 'bedrock-floor-model')
+  const human = run(args)
+  assert(json.code === 0 && finding?.status === 'scheduled' && finding.via === 'aws-bedrock' && finding.date_precision === 'tentative' && finding.shutdown === shutdown, `Bedrock tentative-only temp feed stays scheduled for floor ${shutdown}`)
+  assert(human.code === 0 && human.out.includes(`scheduled - tentative, not announced: not sooner than ${shutdown}`), 'Bedrock tentative consumer reports not sooner than wording')
+}
+assert(validateFeed({ ...tentativeFeedBase, models: [{ id: 'floorless', date_precision: 'tentative' }] }).some(error => error.path.endsWith('.shutdown')), 'tentative precision requires a shutdown date')
+assert(validateFeed({ ...tentativeFeedBase, models: [{ id: 'floorless', distributions: [{ via: 'aws-bedrock', date_precision: 'tentative', source: 'https://example.invalid/bedrock' }] }] }).some(error => error.path.endsWith('.shutdown')), 'tentative distribution precision requires a shutdown date')
 const optionsCheck = formatCheck({ findings: [{ ...earliestFinding, replacement: null, replacement_options: ['first-choice', 'second-choice'] }], bad: [earliestFinding], scannedFiles: 1, days: 30, scope: 'all' })
 assert(optionsCheck.includes('options: first-choice | second-choice'), 'human check output renders replacement options compactly')
 const earliestSchedule = formatSchedule({
-  items: [earliestFinding],
+  items: [tentativeFloorFinding],
   candidate_model_references: [],
   unresolved_integrations: [],
-  earliest_risk: { safe_until: '2026-08-20', id: 'earliest-model' },
+  earliest_risk: { safe_until: '2026-10-17', id: 'tentative-floor-model' },
 }, 30)
-assert(earliestSchedule.includes('no earlier than 2026-08-20'), 'human schedule output renders earliest shutdown as a lower bound')
+assert(earliestSchedule.includes(tentativeHumanText), 'human schedule output identifies the tentative unannounced floor')
+
+const tentativeFloorDir = path.join(tempRoot, 'tentative-floor')
+const tentativeFloorFeeds = path.join(tentativeFloorDir, 'feeds')
+fs.mkdirSync(tentativeFloorFeeds, { recursive: true })
+fs.writeFileSync(path.join(tentativeFloorDir, 'app.py'), 'MODEL = "tentative-floor-model"\nPAST_MODEL = "past-tentative-floor-model"\n')
+fs.writeFileSync(path.join(tentativeFloorFeeds, 'anthropic.json'), JSON.stringify({
+  spec: 'model-eol/0.1',
+  publisher: 'anthropic',
+  generated: '2026-08-18T00:00:00Z',
+  source: 'https://example.invalid/anthropic',
+  policy: tentativePolicy,
+  models: [
+    { id: 'tentative-floor-model', shutdown: '2026-09-29', date_precision: 'tentative' },
+    { id: 'past-tentative-floor-model', shutdown: '2026-08-01', date_precision: 'tentative' },
+  ],
+}))
+const tentativeFloorCheck = run(['check', tentativeFloorDir, '--feeds', tentativeFloorFeeds, '--days', '30'])
+const tentativeFloorSchedule = run(['schedule', tentativeFloorDir, '--feeds', tentativeFloorFeeds, '--days', '30'])
+const tentativeFloorInventory = run(['inventory', tentativeFloorDir, '--feeds', tentativeFloorFeeds, '--days', '30', '--format', 'text'])
+assert(tentativeFloorCheck.code === 0, 'check exits zero for a tentative floor inside the threshold')
+assert(tentativeFloorCheck.out.includes(tentativeHumanText), 'check renders the tentative-floor policy guarantee')
+assert(tentativeFloorSchedule.out.includes(tentativeHumanText), 'schedule renders the tentative-floor policy guarantee')
+assert(tentativeFloorInventory.out.includes(tentativeHumanText), 'inventory renders the tentative-floor policy guarantee')
+const tentativeFeedPath = path.join(tentativeFloorFeeds, 'anthropic.json')
+const validTentativeFeed = run(['validate', tentativeFeedPath])
+assert(validTentativeFeed.code === 0, 'validate accepts tentative model precision')
+const invalidPrecisionFeed = JSON.parse(fs.readFileSync(tentativeFeedPath, 'utf8'))
+invalidPrecisionFeed.models[0].date_precision = 'approximate'
+const invalidPrecisionPath = path.join(tentativeFloorDir, 'invalid-precision.json')
+fs.writeFileSync(invalidPrecisionPath, JSON.stringify(invalidPrecisionFeed))
+const invalidPrecisionValidation = run(['validate', invalidPrecisionPath])
+assert(invalidPrecisionValidation.code === 2 && invalidPrecisionValidation.err.includes('date_precision'), 'validate rejects an unknown date precision')
+
+const earliestRegressionDir = path.join(tempRoot, 'earliest-regression')
+const earliestRegressionFeeds = path.join(earliestRegressionDir, 'feeds')
+fs.mkdirSync(earliestRegressionFeeds, { recursive: true })
+fs.writeFileSync(path.join(earliestRegressionDir, 'app.py'), 'MODEL = "gemini-2.0-flash"\n')
+fs.writeFileSync(path.join(earliestRegressionFeeds, 'google.json'), JSON.stringify({
+  spec: 'model-eol/0.1',
+  publisher: 'google',
+  generated: '2026-09-03T00:00:00Z',
+  source: 'https://example.invalid/google',
+  models: [{ id: 'gemini-2.0-flash', shutdown: '2026-06-01', date_precision: 'earliest' }],
+}))
+const earliestRegressionCheck = run(['check', earliestRegressionDir, '--feeds', earliestRegressionFeeds, '--days', '90'])
+assert(earliestRegressionCheck.code === 1 && earliestRegressionCheck.out.includes('RETIRED no earlier than 2026-06-01'), 'check fails for a past Google earliest date without an announcement')
 
 const duplicateFeeds = path.join(tempRoot, 'duplicate-feeds')
 fs.mkdirSync(duplicateFeeds)
@@ -1150,6 +1637,7 @@ const applyItem = {
   shutdown: '2026-07-01',
   days: -31,
   status: 'retired',
+  waiver: null,
   sources: [],
   notes: null,
 }

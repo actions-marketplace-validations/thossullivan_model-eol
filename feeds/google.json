@@ -1,7 +1,7 @@
 {
   "spec": "model-eol/0.1",
   "publisher": "google",
-  "generated": "2026-08-18T00:47:44.931Z",
+  "generated": "2026-09-07T05:31:03.696Z",
   "source": "https://ai.google.dev/gemini-api/docs/deprecations",
   "models": [
     {
@@ -513,7 +513,8 @@
     },
     {
       "id": "lyria-3-pro-preview",
-      "source": "https://ai.google.dev/gemini-api/docs/deprecations"
+      "source": "https://ai.google.dev/gemini-api/docs/deprecations",
+      "replacement": "lyria-3.5"
     },
     {
       "id": "lyria-realtime-exp",
@@ -574,7 +575,11 @@
       ]
     },
     {
-      "id": "gemini-omni-flash-preview"
+      "id": "gemini-omni-flash-preview",
+      "source": "https://ai.google.dev/gemini-api/docs/deprecations",
+      "shutdown": "2026-09-30",
+      "date_precision": "earliest",
+      "replacement": "gemini-omni-1.1-flash"
     },
     {
       "id": "gemini-robotics-er-2-preview"
@@ -610,7 +615,42 @@
       "id": "gemini-robotics-er-2-streaming-preview"
     },
     {
-      "id": "gemini-3.5-live-translate-preview"
+      "id": "gemini-3.5-live-translate-preview",
+      "source": "https://ai.google.dev/gemini-api/docs/deprecations"
+    },
+    {
+      "id": "gemini-3.5-transcribe-live",
+      "source": "https://ai.google.dev/gemini-api/docs/deprecations"
+    },
+    {
+      "id": "gemini-3.5-transcribe",
+      "source": "https://ai.google.dev/gemini-api/docs/deprecations"
+    },
+    {
+      "id": "gemini-omni-1.1-flash",
+      "source": "https://ai.google.dev/gemini-api/docs/deprecations"
+    },
+    {
+      "id": "gemini-3.8-flash",
+      "source": "https://ai.google.dev/gemini-api/docs/deprecations",
+      "distributions": [
+        {
+          "via": "vertex-ai",
+          "source": "https://docs.cloud.google.com/gemini-enterprise-agent-platform/models/model-versions"
+        }
+      ]
+    },
+    {
+      "id": "lyria-3.5-clip-preview",
+      "source": "https://ai.google.dev/gemini-api/docs/deprecations"
+    },
+    {
+      "id": "lyria-3.5-pro-preview",
+      "source": "https://ai.google.dev/gemini-api/docs/deprecations"
+    },
+    {
+      "id": "lyria-3.5",
+      "source": "https://ai.google.dev/gemini-api/docs/deprecations"
     }
   ]
 }
