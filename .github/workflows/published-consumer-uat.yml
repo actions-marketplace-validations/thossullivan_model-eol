@@ -27,7 +27,7 @@ jobs:
       registry_integrity: ${{ steps.refs.outputs.registry_integrity }}
       moving_current: ${{ steps.refs.outputs.moving_current }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7.0.1
         with:
           ref: ${{ github.event.workflow_run.head_sha }}
           fetch-depth: 0
@@ -102,7 +102,7 @@ jobs:
     if: needs.resolve.outputs.run == 'true'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7.0.1
         with:
           ref: ${{ needs.resolve.outputs.release_commit }}
           persist-credentials: false
@@ -121,7 +121,7 @@ jobs:
     if: needs.resolve.outputs.run == 'true' && needs.resolve.outputs.moving_current == 'true'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7.0.1
         with:
           ref: ${{ needs.resolve.outputs.release_commit }}
           persist-credentials: false
@@ -151,7 +151,7 @@ jobs:
     if: needs.resolve.outputs.run == 'true'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7.0.1
         with:
           ref: ${{ needs.resolve.outputs.release_commit }}
           persist-credentials: false
