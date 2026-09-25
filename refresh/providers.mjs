@@ -351,6 +351,8 @@ function announcementDate(html, tableStart, provider) {
 }
 
 /** Parse an HTML deprecations page into lifecycle records. */
+const ANTHROPIC_NO_RETIREMENT_PATTERN = /^(?:n\/a|to be announced)$/i
+
 export function parseDeprecationsHtml(html, sourceUrl, provider = 'provider') {
   if (typeof html !== 'string' || !html.trim()) throw new Error(`${provider} deprecations page is empty`)
   try {
@@ -387,7 +389,7 @@ export function parseDeprecationsHtml(html, sourceUrl, provider = 'provider') {
       }
       const shutdownCell = row.cells[headers.date]
       const shutdownText = plainText(shutdownCell?.text)
-      const noShutdown = provider === 'anthropic' && /^n\/a$/i.test(shutdownText)
+      const noShutdown = provider === 'anthropic' && ANTHROPIC_NO_RETIREMENT_PATTERN.test(shutdownText)
       const shutdown = noShutdown ? undefined : dateFromText(shutdownText)
       if (!shutdown && !noShutdown) throw new Error(`${provider} deprecations entry ${id} has no valid shutdown date`)
       const replacementCell = headers.recommended >= 0 ? row.cells[headers.recommended] : undefined
@@ -631,7 +633,7 @@ function anthropicStatusDate(text, id, field, cellText = text) {
 
 function anthropicTentativeShutdown(text, id) {
   const value = plainText(text)
-  if (!value || /^n\/a$/i.test(value)) return undefined
+  if (!value || ANTHROPIC_NO_RETIREMENT_PATTERN.test(value)) return undefined
   const match = value.match(/^not sooner than\s+(.+)$/i)
   if (!match) throw new Error(`anthropic model status row ${id} has an unrecognised tentative retirement date: ${value}`)
   return anthropicStatusDate(match[1], id, 'tentative retirement date', value)
@@ -701,7 +703,7 @@ function parseAnthropicStatusTables(html, sourceUrl, announcements) {
         if (shutdown) Object.assign(item, { shutdown, date_precision: 'tentative' })
       } else {
         item.announced = anthropicStatusDate(deprecatedText, id, 'deprecated date')
-        if (!/^n\/a$/i.test(retirementText)) {
+        if (!ANTHROPIC_NO_RETIREMENT_PATTERN.test(retirementText)) {
           item.shutdown = anthropicStatusDate(retirementText, id, 'retirement date')
           if (item.shutdown < item.announced) {
             throw new Error(`anthropic model status row ${id} has retirement before deprecated date: ${retirementText}`)
